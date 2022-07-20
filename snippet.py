@@ -2,29 +2,30 @@
 import json
 import sys
 import logging
+import time
 import argparse
 
 import requests.packages.urllib3.exceptions
 from urllib3.exceptions import InsecureRequestWarning
-
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 """ 
   Please refer following links for more information
   https://developer.vmware.com/docs/vsphere-automation/latest/
-  https://developer.vmware.com/apis/vsphere-automation/latest/vcenter/services/service/
 """
 
 # Create session and set it to ssl verify False
 session = requests.session()
 session.verify = False
 api_session_url = "https://{}/api/session"
-api_get_services = "https://{}/api/vcenter/services"
+api_get_components = "https://{}/api/appliance/support-bundle/components"
+api_create_supportbundle = "https://{}/api/appliance/support-bundle?vmw-task=true"
+api_supportbundle_download_status = "https://{}/api/appliance/support-bundle?size=1"
 
 
 def setup_logging():
     # create logger
-    logger = logging.getLogger("vcenter_services_health_check.py")
+    logger = logging.getLogger("generate_vc_supportbundle.py")
     logger.setLevel(logging.DEBUG)
 
     # create console handler and set level to debug
@@ -51,9 +52,9 @@ def argument_parser():
     parser = argparse.ArgumentParser("Parsing command line arguments")
     parser.add_argument("--vc_ip", dest="vc_ip", default=None,
                         action="store", required=True, help="Vcenter IP address")
-    parser.add_argument("--vc_user_name", dest="vc_user_name", default="administrator@vsphere.local",
+    parser.add_argument("--vc_user_name", dest="vc_user_name", default="",
                         action="store", required=True, help="vCenter userName")
-    parser.add_argument("--vc_password", dest="vc_password", default="Admin!23",
+    parser.add_argument("--vc_password", dest="vc_password", default="",
                         action="store", required=True, help="vCenter Password")
     return parser.parse_args()
 
@@ -98,69 +99,94 @@ def get_session_id(vcip, username, password):
         return output.json()
 
 
-def get_services_state(vcip, session_id):
+def get_support_bundle_components(vcip, session_id):
     """
     :param vcip:
     :param session_id:
     :return:
     """
-    request_url = api_get_services.format(vcip)
+    request_url = api_get_components.format(vcip)
     log.info("Sending API request: GET " + request_url)
-    return session.get(api_get_services.format(vcip, "session"), headers={"vmware-api-session-id": session_id})
+    return session.get(request_url, headers={'vmware-api-session-id': session_id})
 
 
-def run_verify_services_state():
+def create_support_bundle(vcip, session_id):
+    """
+    :param vcip:
+    :param session_id:
+    :return:
+    """
+    data = {"description": "Generate Support bundle"}
+    request_body = json.dumps(data)
+    request_url = api_create_supportbundle.format(vcip)
+    log.info("Sending API request: POST " + request_url)
+    return session.post(request_url, headers={'vmware-api-session-id': session_id,
+                                'Content-type': 'application/json',
+                                'Accept': '*/*'}, data=request_body)
+
+
+def check_supportbundle_status(vcip, session_id):
+    """
+    :param vcip:
+    :param session_id:
+    :return:
+    """
+    request_url = api_supportbundle_download_status.format(vcip)
+    log.info("Sending API request: GET " + request_url)
+    return session.get(request_url, headers={'vmware-api-session-id': session_id})
+
+
+def run_generate_vcsupportbundle_test():
+    test_status = False
     args = argument_parser()
-    service_status_verification = True
-    health_fail_services_count = 0
-    not_running_services_count = 0
-    health_fail_services = []
-    not_running_services = []
     if args.vc_ip is None:
         raise ValueError("VC IP is not provided aborting the test")
+    support_bundle_download_url = None
+    generate_status_check = True
     session_id = get_session_id(args.vc_ip, args.vc_user_name, args.vc_password)
     if session_id is not None:
         log.info("session id :: {}".format(session_id))
-        service_state = get_services_state(args.vc_ip, session_id)
-        if service_state.status_code == 200:
-            service_status_verification = True
-            log.info("Services List and Status:" +
-                     json.dumps(service_state.json(), indent=2, sort_keys=True))
-            service_output = service_state.json()
-            for key, value in service_output.items():
-                log.info("Service name : {}".format(key))
-                log.info("Services Status:" +
-                         json.dumps(value, indent=2, sort_keys=True))
-                if value["startup_type"] == "AUTOMATIC":
-                    if value["state"] == "STARTED":
-                        log.info("Service is running, proceeding to verify the health")
-                        if value["health"] == "HEALTHY":
-                            log.info("Service status is healthy")
-                        else:
-                            log.error("{} Service status is not healthy".format(key))
-                            health_fail_services_count = health_fail_services_count + 1
-                            health_fail_services.append(key)
-                    else:
-                        log.error("{} service is not running".format(key))
-                        log.error("Service is not running considering health status as failed")
-                        not_running_services_count = not_running_services_count + 1
-                        not_running_services.append(key)
-        else:
-            log.error("Failed to get service status")
-            service_status_verification = False
-        delete_session(args.vc_ip, session_id)
-
-    if service_status_verification and health_fail_services_count == 0 and not_running_services_count == 0:
-        log.info("vCenter services health verification has been passed")
+        task_id = create_support_bundle(args.vc_ip, session_id)
+        if task_id.status_code == 202:
+            log.info("Generate support bundle task creation is successful")
+            log.info("Generate support bundle create task ID :: {}".format(task_id.json()))
+            i = 1
+            timeout = 1200
+            timer = 0
+            while generate_status_check:
+                task_status = check_supportbundle_status(args.vc_ip, session_id)
+                if task_status.status_code == 200:
+                    log.info("Getting generate support bundle task status is Success")
+                    log.info("Generate Support bundle status check::{}".format(i))
+                    log.info("Operation is still in progress sleeping for 60 more seconds")
+                    time.sleep(60)
+                    timer = timer + 60
+                    log.info("Total wait time in SECONDS :: {}".format(timer))
+                    log.info("STATUS output :" +
+                             json.dumps(task_status.json(), indent=2, sort_keys=True))
+                    json_data = task_status.json()
+                    download_status = json_data["supportbundle_operations"][0]["status"]
+                    log.info("Support bundle generate status : {}" .format(download_status))
+                    if download_status == "SUCCEEDED":
+                        log.info("Support bundle is generated successfully")
+                        support_bundle_download_url = json_data["supportbundle_operations"][0]["url"]
+                        generate_status_check = False
+                        test_status = True
+                i = i + 1
+                timeout = timeout - 60
+                if timeout <= 0:
+                    log.error("Generate support bundle operation is timed out")
+                    break
+    delete_session(args.vc_ip, session_id)
+    if test_status:
+        log.info("Generate support bundle test executed successfully")
+        return support_bundle_download_url
     else:
-        log.error("vCenter services health verification has been Failed")
-        log.info("Number_of_services_not_running:{}".format(not_running_services_count))
-        log.info("Services not running:{}".format(not_running_services))
-        log.info("Number_of_services_not_healthy:{}".format(health_fail_services_count))
-        log.info("Services not healthy:{}".format(health_fail_services))
+        log.error("Generate support bundle test failed")
         sys.exit(1)
 
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    run_verify_services_state()
+    sb_download_url = run_generate_vcsupportbundle_test()
+    log.info("Support bundle download URL : {}".format(sb_download_url))
